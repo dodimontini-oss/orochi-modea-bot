@@ -1,0 +1,340 @@
+"""
+Mode A ("Orochi"-inspired auction rejection / mean reversion) live bot -
+the ONE variant from orochi_vwap_volprofile_lab.py (see futures_orb/) that
+held up under walk-forward, a long/short split, AND a real 2022
+bear-market stress test. This is a from-scratch reconstruction of the
+PUBLICLY NAMED concepts behind a paid "Orochi framework" trading course
+(Auction Market Theory, Volume Profile, VWAP, order flow) - NOT a copy of
+that course's actual undisclosed rules, which were never seen.
+
+Deployed at RR_RATIO=2.0 specifically - RR=1.5 was meaningfully less
+robust in every check run against it (first-half profit factor 0.99,
+weak short side) and was deliberately NOT deployed.
+
+DEDICATED ALPACA PAPER ACCOUNT - deliberately NOT the same account as
+orb-bot-5min/orb-bot-15min. Those bots already trade QQQ; sharing an
+account would net this bot's positions together with theirs into one
+combined QQQ position with no way to tell which bot owns what shares,
+and one bot's stop could close out shares the other bot still thinks it
+holds. ALPACA_API_KEY/ALPACA_SECRET_KEY below MUST point at a separate
+paper account from the ORB bots.
+
+Rules (exactly matching the validated backtest - orochi_vwap_volprofile_lab.py, Mode A):
+1. Build the most recently COMPLETED session's Volume Profile from 5-min
+   bars: bin by typical price (H+L+C)/3, ~40 bins across that day's
+   range, POC = highest-volume bin, Value Area = 70% of volume expanded
+   outward from POC one bin at a time -> VAH/VAL.
+2. Build today's session VWAP + volume-weighted 2SD bands, computed
+   causally (only bars up to and including "now" - no lookahead).
+3. Scan today's bars from bar #6 onward (skips the noisy first ~30 min)
+   for the FIRST occurrence of: a bar closing beyond yesterday's VAH/VAL
+   AND beyond today's VWAP+-2SD band at the same time (an "excess"),
+   immediately followed by the next bar closing back inside that level
+   (a "rejection") -> confirms the entry, fading back toward VWAP. At
+   most one entry attempt per session, matching the backtest.
+4. Stop = the excess bar's high (short) / low (long). Target = entry +/-
+   2x that risk distance. Real Alpaca BRACKET order (entry+stop+target in
+   one call, GTC so the legs survive past today's close, matching "no
+   session-close flatten" in the backtest).
+
+Checks ALL of today's bars each run (not just the newest), so an
+occasional missed/delayed GitHub Actions run doesn't cause a missed
+signal - same resilience pattern as futures_orb/orb_live_bot.py, which
+this file's structure otherwise closely follows.
+
+Runs every 5 minutes via cron during market hours - see orb_live_bot.py's
+docstring for the DST-safe approach this copies (checks real
+America/New_York time itself rather than relying on a DST-adjusted cron
+schedule).
+
+Environment variables required (a DEDICATED Alpaca paper account - see above):
+    ALPACA_API_KEY
+    ALPACA_SECRET_KEY
+"""
+
+import logging
+import os
+from datetime import datetime, time as dtime, timedelta
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("orochi-modea-live")
+
+ALPACA_API_KEY = os.environ["ALPACA_API_KEY"]
+ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
+TRADING_BASE_URL = "https://paper-api.alpaca.markets"  # paper only - never change without a deliberate decision
+DATA_BASE_URL = "https://data.alpaca.markets"
+HEADERS = {
+    "APCA-API-KEY-ID": ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+}
+
+SYMBOL = "QQQ"
+RR_RATIO = 2.0  # the one variant that held up in every check - see docstring
+RISK_PER_TRADE_PCT = 1.0
+VALUE_AREA_PCT = 0.70
+MIN_BARS_BEFORE_ENTRY = 6
+
+ET = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
+MARKET_OPEN = dtime(9, 30)
+MARKET_CLOSE = dtime(16, 0)
+
+
+def market_is_open_now() -> bool:
+    now_et = datetime.now(ET)
+    if now_et.weekday() >= 5:  # Saturday/Sunday
+        return False
+    return MARKET_OPEN <= now_et.time() <= MARKET_CLOSE
+
+
+def fetch_bars(start_et: datetime, end_et: datetime) -> pd.DataFrame:
+    params = {
+        "timeframe": "5Min",
+        "start": start_et.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end": end_et.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": 2000,
+        "feed": "iex",
+    }
+    resp = requests.get(f"{DATA_BASE_URL}/v2/stocks/{SYMBOL}/bars", headers=HEADERS, params=params, timeout=30)
+    resp.raise_for_status()
+    bars = resp.json().get("bars", [])
+    if not bars:
+        return pd.DataFrame()
+    df = pd.DataFrame(bars)
+    df["t"] = pd.to_datetime(df["t"], utc=True)
+    df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+    df["time_et"] = df["t"].dt.tz_convert(ET)
+    df["session_date"] = df["time_et"].dt.date
+    df["typical"] = (df["high"] + df["low"] + df["close"]) / 3
+    return df.sort_values("t").reset_index(drop=True)
+
+
+def get_today_bars() -> pd.DataFrame:
+    now_et = datetime.now(ET)
+    start_of_day = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    return fetch_bars(start_of_day, now_et)
+
+
+def _volume_profile(day_df: pd.DataFrame):
+    if day_df.empty:
+        return None
+    day_range = day_df["high"].max() - day_df["low"].min()
+    if day_range <= 0:
+        return None
+    bin_width = max(0.05, day_range / 40)
+    bins = np.floor(day_df["typical"] / bin_width).astype(int)
+    vol_by_bin = day_df.groupby(bins)["volume"].sum().sort_index()
+    if vol_by_bin.empty or vol_by_bin.sum() <= 0:
+        return None
+    poc_bin = vol_by_bin.idxmax()
+    total_vol = vol_by_bin.sum()
+    target_vol = total_vol * VALUE_AREA_PCT
+    acc_vol = vol_by_bin[poc_bin]
+    lo_bin, hi_bin = poc_bin, poc_bin
+    bin_list = vol_by_bin.index.tolist()
+    while acc_vol < target_vol:
+        next_lo, next_hi = lo_bin - 1, hi_bin + 1
+        vol_lo, vol_hi = vol_by_bin.get(next_lo, 0), vol_by_bin.get(next_hi, 0)
+        if vol_lo <= 0 and vol_hi <= 0:
+            break
+        if vol_lo >= vol_hi:
+            lo_bin, acc_vol = next_lo, acc_vol + vol_lo
+        else:
+            hi_bin, acc_vol = next_hi, acc_vol + vol_hi
+        if next_lo < bin_list[0] - 1 and next_hi > bin_list[-1] + 1:
+            break  # ran off both ends of the actual data
+    return {"vah": (hi_bin + 1) * bin_width, "val": lo_bin * bin_width}
+
+
+def get_prior_session_profile():
+    """(profile_dict_or_None, prior_date_or_None) for the most recently
+    COMPLETED trading session before today - looks back 10 calendar days
+    to skip weekends/holidays safely without a market-calendar dependency."""
+    now_et = datetime.now(ET)
+    today = now_et.date()
+    lookback_start = (now_et - timedelta(days=10)).replace(hour=0, minute=0, second=0, microsecond=0)
+    df = fetch_bars(lookback_start, now_et)
+    if df.empty:
+        return None, None
+    prior_dates = sorted(d for d in df["session_date"].unique() if d < today)
+    if not prior_dates:
+        return None, None
+    prior_date = prior_dates[-1]
+    day_df = df[df["session_date"] == prior_date]
+    return _volume_profile(day_df), prior_date
+
+
+def session_vwap_bands(day_df: pd.DataFrame) -> pd.DataFrame:
+    """Causal (no-lookahead) session VWAP + 2SD bands - identical formula
+    to orochi_vwap_volprofile_lab.py's session_vwap_bands()."""
+    v = day_df["volume"].to_numpy()
+    p = day_df["typical"].to_numpy()
+    cum_v = np.cumsum(v)
+    cum_pv = np.cumsum(p * v)
+    cum_pv2 = np.cumsum(p * p * v)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        vwap = cum_pv / cum_v
+        variance = cum_pv2 / cum_v - vwap ** 2
+    std = np.sqrt(np.clip(variance, 0, None))
+    out = day_df.copy()
+    out["vwap"] = vwap
+    out["vwap_up2"] = vwap + 2 * std
+    out["vwap_dn2"] = vwap - 2 * std
+    return out
+
+
+def get_position():
+    resp = requests.get(f"{TRADING_BASE_URL}/v2/positions/{SYMBOL}", headers=HEADERS, timeout=10)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_open_orders() -> list:
+    resp = requests.get(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS,
+                         params={"status": "open", "symbols": SYMBOL}, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def already_traded_today() -> bool:
+    """Any order (filled, open, or otherwise) for this symbol submitted
+    today counts as 'already attempted' - matches the backtest's one-
+    entry-attempt-per-session rule."""
+    now_et = datetime.now(ET)
+    start_of_day = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    resp = requests.get(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS,
+                         params={"status": "all", "symbols": SYMBOL, "direction": "desc", "limit": 50,
+                                 "after": start_of_day.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")},
+                         timeout=10)
+    resp.raise_for_status()
+    return len(resp.json()) > 0
+
+
+def get_account_info() -> dict:
+    resp = requests.get(f"{TRADING_BASE_URL}/v2/account", headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def place_bracket_order(direction: str, qty: int, stop: float, target: float) -> dict:
+    side = "buy" if direction == "LONG" else "sell"
+    body = {
+        "symbol": SYMBOL,
+        "qty": str(qty),
+        "side": side,
+        "type": "market",
+        "time_in_force": "gtc",  # keeps the stop/target legs live even if the position carries past today's close
+        "order_class": "bracket",
+        "take_profit": {"limit_price": str(round(target, 2))},
+        "stop_loss": {"stop_price": str(round(stop, 2))},
+    }
+    resp = requests.post(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS, json=body, timeout=15)
+    if resp.status_code >= 400:
+        log.error("Alpaca rejected the order (status %d): %s", resp.status_code, resp.text)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def check_and_trade():
+    if not market_is_open_now():
+        log.info("Outside regular market hours (9:30-16:00 ET, weekdays). No action.")
+        return
+
+    position = get_position()
+    if position is not None and float(position["qty"]) != 0:
+        log.info("Already in a position (%s %s shares). Bracket order manages the exit. No action.",
+                  position["side"], position["qty"])
+        return
+
+    if get_open_orders():
+        log.info("Open order(s) already pending on %s. No action.", SYMBOL)
+        return
+
+    if already_traded_today():
+        log.info("Already attempted an entry today. No action (one attempt per session).")
+        return
+
+    profile, prior_date = get_prior_session_profile()
+    if profile is None:
+        log.info("Could not build a usable prior-session Volume Profile (prior_date=%s). No action.", prior_date)
+        return
+    vah, val = profile["vah"], profile["val"]
+
+    today_df = get_today_bars()
+    if len(today_df) < MIN_BARS_BEFORE_ENTRY + 1:
+        log.info("Only %d bars so far today - need at least %d before trusting the VWAP bands. No action.",
+                  len(today_df), MIN_BARS_BEFORE_ENTRY + 1)
+        return
+
+    vwap_df = session_vwap_bands(today_df)
+
+    direction = entry_ref = stop = None
+    for i in range(MIN_BARS_BEFORE_ENTRY, len(vwap_df) - 1):
+        row = vwap_df.iloc[i]
+        nxt = vwap_df.iloc[i + 1]
+        excess_short = row["close"] > vah and row["close"] > row["vwap_up2"]
+        excess_long = row["close"] < val and row["close"] < row["vwap_dn2"]
+        if excess_short and nxt["close"] < vah:
+            direction, entry_ref, stop = "SHORT", nxt["close"], row["high"]
+            break
+        if excess_long and nxt["close"] > val:
+            direction, entry_ref, stop = "LONG", nxt["close"], row["low"]
+            break
+
+    if direction is None:
+        log.info("No rejection signal yet today (prior-session VAH=%.2f VAL=%.2f, latest close=%.2f). No action.",
+                  vah, val, vwap_df.iloc[-1]["close"])
+        return
+
+    stop_distance = abs(entry_ref - stop)
+    if stop_distance <= 0:
+        log.warning("Zero-width stop distance - skipping.")
+        return
+
+    # Same staleness guard as orb_live_bot.py: a delayed run could act on a
+    # signal that's no longer valid (price has already moved back past the
+    # fixed stop level before the order is even submitted) - Alpaca rejects
+    # a bracket order whose stop is already on the wrong side of price.
+    STOP_SANITY_BUFFER = 0.01
+    current_price = vwap_df.iloc[-1]["close"]
+    if direction == "LONG" and current_price <= stop + STOP_SANITY_BUFFER:
+        log.warning("Stale signal - price (%.2f) has fallen back through the stop (%.2f). Skipping, will "
+                     "recheck next run.", current_price, stop)
+        return
+    if direction == "SHORT" and current_price >= stop - STOP_SANITY_BUFFER:
+        log.warning("Stale signal - price (%.2f) has risen back through the stop (%.2f). Skipping, will "
+                     "recheck next run.", current_price, stop)
+        return
+
+    target = entry_ref + stop_distance * RR_RATIO if direction == "LONG" else entry_ref - stop_distance * RR_RATIO
+
+    account = get_account_info()
+    equity = float(account["equity"])
+    buying_power = float(account["buying_power"])
+    risk_amount = equity * RISK_PER_TRADE_PCT / 100
+    qty = int(risk_amount / stop_distance)
+    # Risk-based sizing can call for more notional than the account can
+    # actually pay for - cap qty at what's affordable so it never gets
+    # rejected for insufficient buying power (same guard as orb_live_bot.py).
+    max_affordable_qty = int(buying_power / current_price)
+    qty = min(qty, max_affordable_qty)
+    if qty <= 0:
+        log.warning("Computed qty <= 0 (risk_amount=%.2f stop_distance=%.4f buying_power=%.2f) - skipping.",
+                     risk_amount, stop_distance, buying_power)
+        return
+
+    log.info("%s rejection signal confirmed (prior-session VAH=%.2f VAL=%.2f) - placing bracket: qty=%d "
+              "stop=%.2f target=%.2f", direction, vah, val, qty, stop, target)
+    result = place_bracket_order(direction, qty, stop, target)
+    log.info("Alpaca response: %s", result)
+
+
+if __name__ == "__main__":
+    check_and_trade()
