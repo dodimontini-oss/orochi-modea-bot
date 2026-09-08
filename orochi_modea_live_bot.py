@@ -83,6 +83,17 @@ HEADERS = {
 SYMBOL = "QQQ"
 RR_RATIO = 2.0  # the one variant that held up in every check - see docstring
 RISK_PER_TRADE_PCT = 1.0
+# Caps position notional at MAX_LEVERAGE x equity, matching a standard
+# Robinhood Gold / Reg-T margin account's OVERNIGHT buying power (2x
+# equity) - not Robinhood's 4x day-trade buying power, since that only
+# applies to intraday round trips on a PDT-flagged account and evaporates
+# by end of day; this bot holds positions overnight (GTC, no session-
+# close flatten), so 2x is the honest real-broker comparison. Added
+# 2026-09-08 after a live trade sized to ~4x equity (tight stop distance
+# let 1%-risk sizing call for far more shares than the account's actual
+# Alpaca paper buying power realistically should allow) - only ever
+# shrinks qty, same as the buying-power cap below; never grows it.
+MAX_LEVERAGE = 2.0
 VALUE_AREA_PCT = 0.70
 MIN_BARS_BEFORE_ENTRY = 6
 
@@ -349,6 +360,13 @@ def check_and_trade():
     # rejected for insufficient buying power (same guard as orb_live_bot.py).
     max_affordable_qty = int(buying_power / current_price)
     qty = min(qty, max_affordable_qty)
+    # Real incident 2026-09-08: a tight stop_distance let pure risk-based
+    # sizing call for far more shares than reasonable leverage should allow
+    # (a live trade sized to ~4x equity, only bounded by Alpaca's generous
+    # paper buying power). Cap notional at MAX_LEVERAGE x equity too - same
+    # "only ever shrinks qty" safety property as the buying-power cap above.
+    max_leverage_qty = int((equity * MAX_LEVERAGE) / current_price)
+    qty = min(qty, max_leverage_qty)
     if qty <= 0:
         log.warning("Computed qty <= 0 (risk_amount=%.2f stop_distance=%.4f buying_power=%.2f) - skipping.",
                      risk_amount, stop_distance, buying_power)
