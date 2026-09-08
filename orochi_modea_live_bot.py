@@ -11,13 +11,20 @@ Deployed at RR_RATIO=2.0 specifically - RR=1.5 was meaningfully less
 robust in every check run against it (first-half profit factor 0.99,
 weak short side) and was deliberately NOT deployed.
 
-DEDICATED ALPACA PAPER ACCOUNT - deliberately NOT the same account as
-orb-bot-5min/orb-bot-15min. Those bots already trade QQQ; sharing an
-account would net this bot's positions together with theirs into one
-combined QQQ position with no way to tell which bot owns what shares,
-and one bot's stop could close out shares the other bot still thinks it
-holds. ALPACA_API_KEY/ALPACA_SECRET_KEY below MUST point at a separate
-paper account from the ORB bots.
+DEDICATED ALPACA PAPER ACCOUNT - as of 2026-09-08, its own account,
+separate from every other bot. (History: originally deployed sharing the
+crypto bot's account, since that account doesn't trade QQQ itself - fine
+in isolation, but it meant this bot's account WAS shadowed by another
+QQQ strategy the moment orderflow_cvd15min_bot was scoped, since sharing
+still collides whenever ANY two QQQ-trading bots land on the same
+account. Moved to its own account at the same time for that reason, once
+a second Alpaca login provided the extra paper-account slots to do it
+properly.) Both orb-bot-5min and orb-bot-15min ALSO trade QQQ on their
+own separate accounts - sharing with any of them (or leaving this on a
+shared account at all) risks netting positions together with no way to
+tell which bot owns what shares, and one bot's stop closing out shares
+another bot still thinks it holds. ALPACA_API_KEY/ALPACA_SECRET_KEY below
+MUST point at this bot's own dedicated paper account.
 
 Rules (exactly matching the validated backtest - orochi_vwap_volprofile_lab.py, Mode A):
 1. Build the most recently COMPLETED session's Volume Profile from 5-min
@@ -223,6 +230,23 @@ def get_account_info() -> dict:
     return resp.json()
 
 
+def get_latest_trade_price() -> float:
+    """Real-time last-trade price, used as a final freshness check right
+    before order submission. `current_price` above (a 5-min bar's close)
+    can itself be almost 5 minutes stale, and several more API calls
+    (get_account_info, etc.) pass before the order actually reaches
+    Alpaca - real incident 2026-09-08: the bar-close check passed, but by
+    submission time live price had fallen further through the stop and
+    Alpaca correctly rejected it (422, twice in a row, each crashing the
+    run) since the rejected order was never recorded so the identical
+    stale signal kept retrying every 5 minutes. This closes most of that
+    gap by checking again against an actual live trade price."""
+    resp = requests.get(f"{DATA_BASE_URL}/v2/stocks/{SYMBOL}/trades/latest", headers=HEADERS,
+                         params={"feed": "iex"}, timeout=10)
+    resp.raise_for_status()
+    return float(resp.json()["trade"]["p"])
+
+
 def place_bracket_order(direction: str, qty: int, stop: float, target: float) -> dict:
     side = "buy" if direction == "LONG" else "sell"
     body = {
@@ -330,9 +354,42 @@ def check_and_trade():
                      risk_amount, stop_distance, buying_power)
         return
 
+    # Final freshness check, immediately before submission, against a real
+    # live trade price rather than the (potentially minutes-stale) bar
+    # close used for the checks above - see get_latest_trade_price()'s
+    # docstring for the real incident this fixes.
+    try:
+        fresh_price = get_latest_trade_price()
+    except requests.exceptions.RequestException as exc:
+        log.warning("Could not fetch a live quote for the final freshness check (%s) - skipping this run, "
+                     "will recheck next run.", exc)
+        return
+    if direction == "LONG" and fresh_price <= stop + STOP_SANITY_BUFFER:
+        log.warning("Stale signal (final live-price check) - price (%.2f) has fallen back through the stop "
+                     "(%.2f). Skipping, will recheck next run.", fresh_price, stop)
+        return
+    if direction == "SHORT" and fresh_price >= stop - STOP_SANITY_BUFFER:
+        log.warning("Stale signal (final live-price check) - price (%.2f) has risen back through the stop "
+                     "(%.2f). Skipping, will recheck next run.", fresh_price, stop)
+        return
+
     log.info("%s rejection signal confirmed (prior-session VAH=%.2f VAL=%.2f) - placing bracket: qty=%d "
               "stop=%.2f target=%.2f", direction, vah, val, qty, stop, target)
-    result = place_bracket_order(direction, qty, stop, target)
+    try:
+        result = place_bracket_order(direction, qty, stop, target)
+    except requests.exceptions.HTTPError as exc:
+        # Belt-and-suspenders: even the fresh-price check above has a
+        # sub-second gap before the order actually lands. Alpaca rejecting
+        # a bracket because price moved is an expected, recoverable
+        # outcome (exactly like the local staleness skips above) - it must
+        # NOT crash the script, or the rejected (never-recorded) order
+        # just gets identically re-attempted and re-failed every 5 minutes
+        # for the rest of the session (this is exactly what happened live
+        # 2026-09-08, and to orb-bot-5min on 2026-08-28 before its own
+        # equivalent guard was added - see project memory).
+        log.warning("Alpaca still rejected the order despite the freshness checks (%s) - treating as a stale "
+                     "signal, not a crash. Skipping, will recheck next run.", exc)
+        return
     log.info("Alpaca response: %s", result)
 
 
