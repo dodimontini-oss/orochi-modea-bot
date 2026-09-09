@@ -59,6 +59,11 @@ Environment variables required (a DEDICATED Alpaca paper account - see above):
     ALPACA_SECRET_KEY
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from trading_core import execution as safety
+
 import logging
 import os
 from datetime import datetime, time as dtime, timedelta
@@ -104,10 +109,13 @@ MARKET_CLOSE = dtime(16, 0)
 
 
 def market_is_open_now() -> bool:
-    now_et = datetime.now(ET)
-    if now_et.weekday() >= 5:  # Saturday/Sunday
+    global SESSION_CLOSE
+    broker=safety.Alpaca(TRADING_BASE_URL,HEADERS)
+    session=broker.session()
+    if session is None:
         return False
-    return MARKET_OPEN <= now_et.time() <= MARKET_CLOSE
+    opening,SESSION_CLOSE=session
+    return opening <= pd.Timestamp.now(tz="America/New_York") < SESSION_CLOSE
 
 
 def fetch_bars(start_et: datetime, end_et: datetime) -> pd.DataFrame:
@@ -129,7 +137,7 @@ def fetch_bars(start_et: datetime, end_et: datetime) -> pd.DataFrame:
     df["time_et"] = df["t"].dt.tz_convert(ET)
     df["session_date"] = df["time_et"].dt.date
     df["typical"] = (df["high"] + df["low"] + df["close"]) / 3
-    return df.sort_values("t").reset_index(drop=True)
+    return safety.closed_rth(df.sort_values("t").reset_index(drop=True))
 
 
 def get_today_bars() -> pd.DataFrame:
@@ -139,34 +147,7 @@ def get_today_bars() -> pd.DataFrame:
 
 
 def _volume_profile(day_df: pd.DataFrame):
-    if day_df.empty:
-        return None
-    day_range = day_df["high"].max() - day_df["low"].min()
-    if day_range <= 0:
-        return None
-    bin_width = max(0.05, day_range / 40)
-    bins = np.floor(day_df["typical"] / bin_width).astype(int)
-    vol_by_bin = day_df.groupby(bins)["volume"].sum().sort_index()
-    if vol_by_bin.empty or vol_by_bin.sum() <= 0:
-        return None
-    poc_bin = vol_by_bin.idxmax()
-    total_vol = vol_by_bin.sum()
-    target_vol = total_vol * VALUE_AREA_PCT
-    acc_vol = vol_by_bin[poc_bin]
-    lo_bin, hi_bin = poc_bin, poc_bin
-    bin_list = vol_by_bin.index.tolist()
-    while acc_vol < target_vol:
-        next_lo, next_hi = lo_bin - 1, hi_bin + 1
-        vol_lo, vol_hi = vol_by_bin.get(next_lo, 0), vol_by_bin.get(next_hi, 0)
-        if vol_lo <= 0 and vol_hi <= 0:
-            break
-        if vol_lo >= vol_hi:
-            lo_bin, acc_vol = next_lo, acc_vol + vol_lo
-        else:
-            hi_bin, acc_vol = next_hi, acc_vol + vol_hi
-        if next_lo < bin_list[0] - 1 and next_hi > bin_list[-1] + 1:
-            break  # ran off both ends of the actual data
-    return {"vah": (hi_bin + 1) * bin_width, "val": lo_bin * bin_width}
+    return safety.value_area(day_df, VALUE_AREA_PCT)
 
 
 def get_prior_session_profile():
@@ -258,23 +239,13 @@ def get_latest_trade_price() -> float:
     return float(resp.json()["trade"]["p"])
 
 
-def place_bracket_order(direction: str, qty: int, stop: float, target: float) -> dict:
-    side = "buy" if direction == "LONG" else "sell"
-    body = {
-        "symbol": SYMBOL,
-        "qty": str(qty),
-        "side": side,
-        "type": "market",
-        "time_in_force": "gtc",  # keeps the stop/target legs live even if the position carries past today's close
-        "order_class": "bracket",
-        "take_profit": {"limit_price": str(round(target, 2))},
-        "stop_loss": {"stop_price": str(round(stop, 2))},
-    }
-    resp = requests.post(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS, json=body, timeout=15)
-    if resp.status_code >= 400:
-        log.error("Alpaca rejected the order (status %d): %s", resp.status_code, resp.text)
-    resp.raise_for_status()
-    return resp.json()
+def place_bracket_order(direction: str, qty: int, stop: float, target: float, client_id=None) -> dict:
+    if client_id is None:
+        raise ValueError("Missing signal identity")
+    return safety.Alpaca(TRADING_BASE_URL,HEADERS).submit({"symbol":SYMBOL,"qty":str(qty),
+        "side":"buy" if direction=="LONG" else "sell","type":"market","time_in_force":"gtc",
+        "order_class":"bracket","take_profit":{"limit_price":str(round(target,2))},
+        "stop_loss":{"stop_price":str(round(stop,2))},"client_order_id":client_id})
 
 
 def check_and_trade():
@@ -391,10 +362,16 @@ def check_and_trade():
                      "(%.2f). Skipping, will recheck next run.", fresh_price, stop)
         return
 
+    stop_distance = abs(fresh_price-stop)
+    qty = min(int(risk_amount/stop_distance), int(buying_power*.95/fresh_price),
+              int(equity*MAX_LEVERAGE/fresh_price))
+    if qty <= 0:
+        return
+    target = fresh_price + stop_distance*RR_RATIO if direction=="LONG" else fresh_price-stop_distance*RR_RATIO
     log.info("%s rejection signal confirmed (prior-session VAH=%.2f VAL=%.2f) - placing bracket: qty=%d "
               "stop=%.2f target=%.2f", direction, vah, val, qty, stop, target)
     try:
-        result = place_bracket_order(direction, qty, stop, target)
+        result = place_bracket_order(direction, qty, stop, target, safety.signal_id("orochi", SYMBOL, pd.Timestamp.now(tz="America/New_York").normalize()))
     except requests.exceptions.HTTPError as exc:
         # Belt-and-suspenders: even the fresh-price check above has a
         # sub-second gap before the order actually lands. Alpaca rejecting
